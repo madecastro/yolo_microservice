@@ -1,13 +1,12 @@
 from flask import Flask, request, jsonify
-import torch
-from PIL import Image
-import io
-import base64
+from ultralytics import YOLO
 import cv2
 import numpy as np
+from PIL import Image
+import base64
 
 app = Flask(__name__)
-model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
+model = YOLO('yolov8n.pt')  # lightweight YOLOv8 model
 
 def crop_and_encode(image_np, box):
     x1, y1, x2, y2 = map(int, box)
@@ -20,21 +19,18 @@ def detect():
     if 'image' not in request.files:
         return jsonify({'error': 'Image file is required'}), 400
 
-    image_file = request.files['image']
-    image = Image.open(image_file.stream).convert('RGB')
-    results = model(image)
-
+    image = Image.open(request.files['image'].stream).convert('RGB')
     image_np = np.array(image)
-    detections = []
+    results = model(image_np)[0]
 
-    for *box, conf, cls in results.xyxy[0].tolist():
+    detections = []
+    for box in results.boxes.xyxy.cpu().numpy():
+        x1, y1, x2, y2 = box[:4]
+        conf = float(box[4]) if len(box) > 4 else 0.5
         if conf < 0.4:
             continue
-        crop_base64 = crop_and_encode(image_np, box)
-        detections.append({
-            'base64': crop_base64,
-            'confidence': round(conf, 3)
-        })
+        crop_b64 = crop_and_encode(image_np, (x1, y1, x2, y2))
+        detections.append({ 'base64': crop_b64, 'confidence': round(conf, 3) })
 
     return jsonify(detections)
 
