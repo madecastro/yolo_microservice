@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: yolo-detection
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    buildCommand: ""
+    startCommand: "python yolo_service.py"
+    autoDeploy: true
