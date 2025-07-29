@@ -6,7 +6,7 @@ from PIL import Image
 import base64
 
 app = Flask(__name__)
-model = YOLO('yolov8n.pt')  # lightweight YOLOv8 model
+model = YOLO('yolov8x.pt')  # high accuracy YOLOv8 model
 
 def crop_and_encode(image_np, box):
     x1, y1, x2, y2 = map(int, box)
