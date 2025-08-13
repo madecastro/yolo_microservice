@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Python deps
 RUN pip install --upgrade pip && \
-    pip install --no-cache-dir flask pillow opencv-python-headless numpy gunicorn && \
+    pip install --no-cache-dir flask pillow opencv-python-headless numpy gunicorn openai && \
     pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu && \
     pip install --no-cache-dir ultralytics
 
