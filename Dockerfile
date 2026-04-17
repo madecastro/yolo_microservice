@@ -4,7 +4,7 @@ WORKDIR /app
 COPY yolo_service.py .
 
 RUN apt-get update && apt-get install -y \
-    libgl1-mesa-glx \
+    libgl1 \
     libglib2.0-0 \
     ffmpeg \
     && pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu \
