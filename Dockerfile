@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y \
     libglib2.0-0 \
     ffmpeg \
     && pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu \
-    && pip install flask pillow opencv-python-headless numpy ultralytics \
+    && pip install flask pillow opencv-python-headless numpy ultralytics pandas seaborn \
     && rm -rf /var/lib/apt/lists/*
 
 EXPOSE 5000
