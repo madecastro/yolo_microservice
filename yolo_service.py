@@ -23,6 +23,11 @@ def crop_and_encode(image_np, box):
     return base64.b64encode(buf).decode('utf-8')
 
 
+def frame_to_base64_jpeg(frame):
+    _, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    return base64.b64encode(buf).decode('utf-8')
+
+
 def iou(b1, b2):
     xi1, yi1 = max(b1[0], b2[0]), max(b1[1], b2[1])
     xi2, yi2 = min(b1[2], b2[2]), min(b1[3], b2[3])
@@ -40,9 +45,9 @@ def is_duplicate(box, cls, seen):
     return False
 
 
-def make_detection(image_np, box, conf, cls, img_w, img_h):
+def make_detection(image_np, box, conf, cls, img_w, img_h, first_seen_sec=None):
     x1, y1, x2, y2 = map(int, box)
-    return {
+    det = {
         'base64':     crop_and_encode(image_np, box),
         'confidence': round(conf, 3),
         'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
@@ -50,6 +55,9 @@ def make_detection(image_np, box, conf, cls, img_w, img_h):
         'img_width':  img_w,
         'img_height': img_h,
     }
+    if first_seen_sec is not None:
+        det['first_seen_sec'] = round(first_seen_sec, 2)
+    return det
 
 
 @app.route('/detect', methods=['POST'])
@@ -93,6 +101,8 @@ def detect_video():
         img_h          = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
         seen, detections, frame_idx = [], [], 0
+        best_frame        = None  # (rgb_frame, detection_count)
+        best_frame_count  = -1
 
         while True:
             ret, frame = cap.read()
@@ -104,17 +114,43 @@ def detect_video():
 
             pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             results = model(pil_img)
+            t_sec   = frame_idx / video_fps
 
+            frame_det_count = 0
             for *box, conf, cls in results.xyxy[0].tolist():
-                if conf < CONF_THRESHOLD or is_duplicate(box, cls, seen):
+                if conf < CONF_THRESHOLD:
+                    continue
+                frame_det_count += 1
+                if is_duplicate(box, cls, seen):
                     continue
                 seen.append((box, cls))
-                detections.append(make_detection(frame, box, conf, cls, img_w, img_h))
+                detections.append(make_detection(frame, box, conf, cls, img_w, img_h, first_seen_sec=t_sec))
+
+            # Track the frame with the most detections as hero frame candidate
+            if frame_det_count > best_frame_count:
+                best_frame_count = frame_det_count
+                best_frame = frame.copy()
 
             frame_idx += 1
 
         cap.release()
-        return jsonify({'width': img_w, 'height': img_h, 'detections': detections})
+
+        # Fallback: if we never found a frame with detections, grab the middle frame
+        if best_frame is None:
+            cap2 = cv2.VideoCapture(tmp_path)
+            total = int(cap2.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+            cap2.set(cv2.CAP_PROP_POS_FRAMES, total // 2)
+            _, best_frame = cap2.read()
+            cap2.release()
+
+        hero_frame_b64 = frame_to_base64_jpeg(best_frame) if best_frame is not None else None
+
+        return jsonify({
+            'width': img_w,
+            'height': img_h,
+            'detections': detections,
+            'hero_frame': hero_frame_b64
+        })
 
     finally:
         os.unlink(tmp_path)
