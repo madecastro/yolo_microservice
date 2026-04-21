@@ -11,9 +11,12 @@ import os
 app = Flask(__name__)
 model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
 
-CONF_THRESHOLD    = 0.4
-IOU_DEDUP         = 0.3
-VIDEO_SAMPLE_FPS  = 2
+# Env-tunable so we can adjust without redeploying.
+# Lower threshold = more (but noisier) detections.
+CONF_THRESHOLD    = float(os.environ.get('CONF_THRESHOLD', 0.4))
+IOU_DEDUP         = float(os.environ.get('IOU_DEDUP', 0.3))
+VIDEO_SAMPLE_FPS  = float(os.environ.get('VIDEO_SAMPLE_FPS', 2))
+VERBOSE_DETECTIONS = os.environ.get('YOLO_VERBOSE', 'true').lower() == 'true'
 
 
 def crop_and_encode(image_np, box):
@@ -73,13 +76,24 @@ def detect():
     img_w, img_h = image.size
     results   = model(image)
     image_np  = np.array(image)
+    raw       = results.xyxy[0].tolist()
     detections = []
+    kept = 0
+    dropped = 0
 
-    for *box, conf, cls in results.xyxy[0].tolist():
+    for *box, conf, cls in raw:
+        name = model.names[int(cls)]
         if conf < CONF_THRESHOLD:
+            if VERBOSE_DETECTIONS:
+                print(f"   [drop conf<{CONF_THRESHOLD}]  {name} conf={conf:.3f}")
+            dropped += 1
             continue
+        if VERBOSE_DETECTIONS:
+            print(f"   [keep] {name} conf={conf:.3f} box=({int(box[0])},{int(box[1])})→({int(box[2])},{int(box[3])})")
+        kept += 1
         detections.append(make_detection(image_np, box, conf, cls, img_w, img_h))
 
+    print(f"🔎 /detect raw={len(raw)} kept={kept} dropped={dropped} (threshold={CONF_THRESHOLD})")
     return jsonify({'width': img_w, 'height': img_h, 'detections': detections})
 
 
