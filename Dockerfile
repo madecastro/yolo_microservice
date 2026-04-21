@@ -13,4 +13,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 EXPOSE 5000
-CMD ["python", "yolo_service.py"]
+# -u disables stdout buffering so print() output reaches Render logs in real time.
+# Also set PYTHONUNBUFFERED for any subprocess / library prints.
+ENV PYTHONUNBUFFERED=1
+CMD ["python", "-u", "yolo_service.py"]
