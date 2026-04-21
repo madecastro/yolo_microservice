@@ -8,12 +8,14 @@ RUN apt-get update && apt-get install -y \
     libglib2.0-0 \
     ffmpeg \
     && pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu \
-    && pip install -r https://raw.githubusercontent.com/ultralytics/yolov5/master/requirements.txt \
-    && pip install flask opencv-python-headless ultralytics \
+    && pip install flask pillow opencv-python-headless numpy ultralytics openai pandas seaborn \
     && rm -rf /var/lib/apt/lists/*
+
+# Pre-download YOLOv8x weights at build time so first request doesn't cold-start.
+ENV YOLO_CONFIG_DIR=/tmp
+RUN python -c "from ultralytics import YOLO; YOLO('yolov8x.pt')"
 
 EXPOSE 5000
 # -u disables stdout buffering so print() output reaches Render logs in real time.
-# Also set PYTHONUNBUFFERED for any subprocess / library prints.
 ENV PYTHONUNBUFFERED=1
 CMD ["python", "-u", "yolo_service.py"]
