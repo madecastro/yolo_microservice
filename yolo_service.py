@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 import torch
-from PIL import Image
+from PIL import Image, ImageOps
 import io
 import base64
 import cv2
@@ -65,7 +65,11 @@ def detect():
     if 'image' not in request.files:
         return jsonify({'error': 'Image file is required'}), 400
 
+    # PIL does NOT apply EXIF orientation by default, but Cloudinary's secure_url
+    # auto-rotates when served. Normalize here so YOLO's (img_w, img_h) and
+    # detection bboxes live in the same coord system the browser will render.
     image = Image.open(request.files['image'].stream).convert('RGB')
+    image = ImageOps.exif_transpose(image)
     img_w, img_h = image.size
     results   = model(image)
     image_np  = np.array(image)
