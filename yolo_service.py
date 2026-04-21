@@ -101,8 +101,10 @@ def detect_video():
         img_h          = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
         seen, detections, frame_idx = [], [], 0
-        best_frame        = None  # (rgb_frame, detection_count)
+        best_frame        = None
         best_frame_count  = -1
+        best_frame_sec    = 0.0
+        hero_reason       = 'fallback'
 
         while True:
             ret, frame = cap.read()
@@ -126,21 +128,24 @@ def detect_video():
                 seen.append((box, cls))
                 detections.append(make_detection(frame, box, conf, cls, img_w, img_h, first_seen_sec=t_sec))
 
-            # Track the frame with the most detections as hero frame candidate
             if frame_det_count > best_frame_count:
                 best_frame_count = frame_det_count
                 best_frame = frame.copy()
+                best_frame_sec = t_sec
+                hero_reason = f'highest-detection-count ({frame_det_count})'
 
             frame_idx += 1
 
         cap.release()
 
-        # Fallback: if we never found a frame with detections, grab the middle frame
         if best_frame is None:
             cap2 = cv2.VideoCapture(tmp_path)
             total = int(cap2.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
-            cap2.set(cv2.CAP_PROP_POS_FRAMES, total // 2)
+            mid = total // 2
+            cap2.set(cv2.CAP_PROP_POS_FRAMES, mid)
             _, best_frame = cap2.read()
+            best_frame_sec = mid / video_fps
+            hero_reason = 'middle-frame fallback (no detections)'
             cap2.release()
 
         hero_frame_b64 = frame_to_base64_jpeg(best_frame) if best_frame is not None else None
@@ -149,7 +154,10 @@ def detect_video():
             'width': img_w,
             'height': img_h,
             'detections': detections,
-            'hero_frame': hero_frame_b64
+            'hero_frame': hero_frame_b64,
+            'hero_frame_sec': round(best_frame_sec, 2),
+            'hero_reason': hero_reason,
+            'video_duration_sec': round(frame_idx / video_fps, 2)
         })
 
     finally:
