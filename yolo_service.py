@@ -196,14 +196,61 @@ def oai_box_proposals(image_bytes, H, W):
         app.logger.warning(f"OpenAI fallback failed: {e}")
         return []
 
-def merge_nms(*box_lists, iou=0.55):
-    """NMS across multiple sources. Preserves the class index from the winning detection."""
+def merge_nms(*box_lists, iou_intra=0.55, iou_cross=0.80):
+    """Class-aware NMS across multiple proposal sources.
+
+    Boxes carry source identity in cls_idx:
+      cls_idx >= 0 → YOLO (real COCO class)
+      cls_idx == -1 → OpenCV rectangle proposal
+      cls_idx == -2 → gpt-4o-mini box fallback
+
+    Two-pass merge:
+      1. Intra-source NMS at iou_intra (tight, default 0.55) — drops
+         duplicate proposals from the same source covering the same region.
+      2. Cross-source NMS at iou_cross (loose, default 0.80) — only
+         suppresses cross-source overlaps when boxes truly cover the same
+         pixels. Sub-region boxes (e.g. an OpenCV bikini-top rect inside
+         a YOLO 'person' box) naturally have low IoU and survive both
+         passes; near-duplicate cross-source boxes (e.g. YOLO 'tie' at
+         IoU 0.85 with an OpenCV 'object' rect on the same tie) get
+         deduped, with the higher-confidence proposal winning.
+
+    Preserves cls_idx from each surviving box so downstream
+    class_name_for resolves to the right source label.
+    """
     merged = [b for lst in box_lists for b in (lst or [])]
     if not merged: return []
-    b = torch.tensor([m[:4] for m in merged], dtype=torch.float32)
-    s = torch.tensor([m[4] for m in merged], dtype=torch.float32)
-    keep = nms(b, s, iou).tolist()
-    return [merged[i] for i in keep]
+
+    def source_of(box):
+        ci = box[5]
+        if ci == -1: return 'opencv'
+        if ci == -2: return 'oai'
+        return 'yolo'
+
+    # Pass 1 — intra-source NMS, tight threshold per source bucket.
+    groups = {}
+    for box in merged:
+        groups.setdefault(source_of(box), []).append(box)
+
+    survivors = []
+    for src_boxes in groups.values():
+        if len(src_boxes) <= 1:
+            survivors.extend(src_boxes)
+            continue
+        b = torch.tensor([m[:4] for m in src_boxes], dtype=torch.float32)
+        s = torch.tensor([m[4] for m in src_boxes], dtype=torch.float32)
+        keep = nms(b, s, iou_intra).tolist()
+        survivors.extend([src_boxes[i] for i in keep])
+
+    # Pass 2 — cross-source NMS, loose threshold so sub-region OpenCV /
+    # gpt-4o-mini boxes inside YOLO containers survive (low IoU) but
+    # near-duplicate cross-source proposals still dedup (IoU > 0.80).
+    if len(survivors) <= 1:
+        return survivors
+    b = torch.tensor([m[:4] for m in survivors], dtype=torch.float32)
+    s = torch.tensor([m[4] for m in survivors], dtype=torch.float32)
+    keep = nms(b, s, iou_cross).tolist()
+    return [survivors[i] for i in keep]
 
 def total_coverage(boxes, H, W):
     area = 0.0
@@ -229,7 +276,10 @@ def run_full_detection(image_np, raw_bytes_for_oai=None, label="image"):
     if FALLBACK_RECT:
         rects = propose_rectangles(image_np)
         rect_count = len(rects)
-        preds = merge_nms(preds, rects, iou=0.55)
+        # Class-aware merge — OpenCV sub-region boxes (e.g. clothing items
+        # inside a YOLO 'person' container) survive at the loose cross-source
+        # threshold; intra-source duplicates still get tight dedup.
+        preds = merge_nms(preds, rects)
 
     # 3. OpenAI fallback — only when recall looks weak
     oai_count = 0
@@ -239,7 +289,7 @@ def run_full_detection(image_np, raw_bytes_for_oai=None, label="image"):
             oai = oai_box_proposals(raw_bytes_for_oai, H, W)
             oai_count = len(oai)
             if oai:
-                preds = merge_nms(preds, oai, iou=0.55)
+                preds = merge_nms(preds, oai)
 
     if VERBOSE:
         print(f"🔎 {label}: yolo={yolo_count} rects={rect_count} openai={oai_count} merged={len(preds)}", flush=True)
