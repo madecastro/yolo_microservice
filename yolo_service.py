@@ -62,7 +62,15 @@ def safe_crop(image_np, box):
     if x2 <= x1 or y2 <= y1:
         return None
     crop = image_np[y1:y2, x1:x2]
-    ok, buf = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    # image_np is RGB (PIL → np.array on the /detect path; explicit BGR→RGB
+    # conversion on the /detect-video path at line 347). cv2.imencode assumes
+    # BGR ordering, so without this conversion the encoded JPEG has R and B
+    # swapped — every cropped detection sent to downstream identification was
+    # being read with skin/hair/clothing colors flipped (e.g. blue bikini
+    # rendered as brown/yellow). The hero frame path is unaffected because
+    # frame_to_base64_jpeg is called with the raw cv2 frame (already BGR).
+    crop_bgr = cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
+    ok, buf = cv2.imencode(".jpg", crop_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
     return base64.b64encode(buf).decode("utf-8") if ok else None
 
 def frame_to_base64_jpeg(frame):
