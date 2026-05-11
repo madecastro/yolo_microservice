@@ -1,7 +1,7 @@
 FROM python:3.9-slim
 
 WORKDIR /app
-COPY yolo_service.py .
+COPY yolo_service.py gunicorn.conf.py ./
 
 RUN apt-get update && apt-get install -y \
     libgl1 \
@@ -19,17 +19,8 @@ EXPOSE 5000
 # Stdout unbuffered so gunicorn / Flask print() output streams to Render logs in real time.
 ENV PYTHONUNBUFFERED=1
 
-# Production WSGI via gunicorn. Single worker because YOLOv8x holds
-# ~500MB+ resident; multiple workers would each load their own model
-# copy and OOM the instance. Single-threaded because PyTorch models
-# aren't reliably thread-safe — concurrent requests queue inside
-# gunicorn rather than racing inside Python. Long timeout for video
-# frame extraction (can take 30-60s on large clips).
-CMD ["gunicorn", \
-     "--workers", "1", \
-     "--threads", "1", \
-     "--timeout", "300", \
-     "--bind", "0.0.0.0:5000", \
-     "--access-logfile", "-", \
-     "--error-logfile", "-", \
-     "yolo_service:app"]
+# Production WSGI via gunicorn, configured by gunicorn.conf.py which
+# reads from GUNICORN_* env vars. Tunables (workers / threads / timeout /
+# max-requests / preload) can be changed in the Render dashboard without
+# rebuilding the Docker image.
+CMD ["gunicorn", "--config", "/app/gunicorn.conf.py", "yolo_service:app"]
