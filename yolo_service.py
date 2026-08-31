@@ -21,6 +21,38 @@ YOLO_IOU      = float(os.getenv("YOLO_IOU", "0.60"))
 YOLO_IMGSZ    = int(os.getenv("YOLO_IMGSZ", "960"))
 YOLO_MAXDET   = int(os.getenv("YOLO_MAX_DET", "300"))
 
+# ── Apparel model (second YOLO head, e.g. DeepFashion2-trained) ───
+# YOLOv8x-COCO covers everyday objects (bottle, chair, handbag, tie) but
+# has no apparel classes: shoes, dresses, tops, bottoms, outerwear are all
+# missed. That's a major recall gap for fashion brand catalogs (measured
+# 86% empty refinedProducts on Soludos — a shoe brand).
+#
+# When YOLO_APPAREL_ENABLED=true AND YOLO_APPAREL_MODEL_PATH exists on
+# disk, every /detect and /detect-video request runs BOTH models
+# sequentially and merges their outputs through the existing merge_nms.
+# The apparel model's cls_idx values are offset by APPAREL_CLS_OFFSET so
+# they route correctly in class_name_for() without polluting the COCO
+# name space.
+#
+# Model file provisioning: baked into the Docker image at build time from
+# YOLO_APPAREL_MODEL_URL (Dockerfile handles the download). Owner-selected
+# checkpoint — env-driven to avoid coupling any one HuggingFace /
+# Ultralytics community model into this file.
+#
+# Memory: YOLOv8x holds ~500MB RSS per worker. With apparel model loaded,
+# that doubles to ~1GB per worker unless GUNICORN_PRELOAD_APP=true (models
+# load ONCE before fork, workers COW-share). Standard Plus (4GB) fits
+# 2-3 workers preload-off, or 5-6 with preload on.
+APPAREL_ENABLED    = os.getenv("YOLO_APPAREL_ENABLED", "true").lower() == "true"
+APPAREL_MODEL_PATH = os.getenv("YOLO_APPAREL_MODEL_PATH", "/app/yolov8x-df2.pt")
+APPAREL_CONF       = float(os.getenv("YOLO_APPAREL_CONF", "0.25"))
+# Class index offset for apparel detections. cls_idx >= APPAREL_CLS_OFFSET
+# means "from the apparel model" — class_name_for() routes on this range.
+# Chosen large enough to leave room for any COCO expansion (COCO has 80
+# classes today; 1000 leaves 920 headroom for any future ultralytics
+# release without needing a migration).
+APPAREL_CLS_OFFSET = int(os.getenv("YOLO_APPAREL_CLS_OFFSET", "1000"))
+
 # ── Tiled inference ───────────────────────────────────────────────
 USE_TILING    = os.getenv("YOLO_TILING", "1") == "1"
 TILE          = int(os.getenv("YOLO_TILE", "1024"))
@@ -48,6 +80,26 @@ os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp")
 
 app = Flask(__name__)
 model = YOLO(MODEL_PATH)
+print(f"🎯 primary model loaded: {MODEL_PATH} ({len(model.names) if hasattr(model, 'names') else '?'} classes)", flush=True)
+
+# Load apparel model when enabled AND the file is present. Failing to load
+# is NOT fatal — the service continues with COCO-only. This keeps the
+# service resilient to a bad checkpoint URL or a Dockerfile build that
+# didn't bake the file in.
+apparel_model = None
+if APPAREL_ENABLED:
+    if os.path.exists(APPAREL_MODEL_PATH):
+        try:
+            apparel_model = YOLO(APPAREL_MODEL_PATH)
+            n_cls = len(apparel_model.names) if hasattr(apparel_model, "names") else "?"
+            print(f"👗 apparel model loaded: {APPAREL_MODEL_PATH} ({n_cls} classes, cls_offset={APPAREL_CLS_OFFSET}, conf_floor={APPAREL_CONF})", flush=True)
+        except Exception as e:
+            print(f"⚠️  apparel model failed to load ({APPAREL_MODEL_PATH}): {e} — falling back to COCO-only", flush=True)
+            apparel_model = None
+    else:
+        print(f"ℹ️  apparel model file not found at {APPAREL_MODEL_PATH} — set YOLO_APPAREL_MODEL_PATH or bake into image via YOLO_APPAREL_MODEL_URL build-arg. Running COCO-only.", flush=True)
+else:
+    print("👗 apparel model DISABLED (YOLO_APPAREL_ENABLED=false)", flush=True)
 
 # ──────────────────────────────────────────────────────────────────
 #  Helpers
@@ -77,24 +129,44 @@ def frame_to_base64_jpeg(frame):
     _, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
     return base64.b64encode(buf).decode('utf-8')
 
-def run_yolo(img_np):
-    """YOLOv8 on a full image (or tile). Returns list of [x1,y1,x2,y2,conf,cls_idx]."""
-    r = model.predict(
-        img_np, conf=YOLO_CONF, iou=YOLO_IOU, imgsz=YOLO_IMGSZ,
+def _run_yolo(model_obj, img_np, conf=None):
+    """Model-agnostic YOLOv8 predict. Returns [[x1,y1,x2,y2,conf,cls_idx], ...].
+    Callers pass the specific model + optional confidence override; the rest
+    of the tuning (IOU, IMGSZ, MAXDET) stays global.
+    """
+    r = model_obj.predict(
+        img_np, conf=(conf if conf is not None else YOLO_CONF), iou=YOLO_IOU, imgsz=YOLO_IMGSZ,
         max_det=YOLO_MAXDET, agnostic_nms=True, augment=False, verbose=False
     )[0]
     if r.boxes is None or len(r.boxes) == 0:
         return []
     xyxy = r.boxes.xyxy.cpu().numpy()
-    conf = r.boxes.conf.cpu().numpy()
+    conf_arr = r.boxes.conf.cpu().numpy()
     cls  = r.boxes.cls.cpu().numpy()
     return [[float(b[0]), float(b[1]), float(b[2]), float(b[3]), float(c), int(k)]
-            for b, c, k in zip(xyxy, conf, cls)]
+            for b, c, k in zip(xyxy, conf_arr, cls)]
 
-def tile_infer(img_np):
+def run_yolo(img_np):
+    """Primary YOLO (COCO). Thin wrapper preserved so existing callers work
+    unchanged."""
+    return _run_yolo(model, img_np)
+
+def run_yolo_apparel(img_np):
+    """Secondary YOLO (apparel). No-op when the model isn't loaded. Offsets
+    every cls_idx by APPAREL_CLS_OFFSET so class_name_for() can route labels
+    to apparel_model.names without colliding with COCO's 0..79 range."""
+    if apparel_model is None:
+        return []
+    preds = _run_yolo(apparel_model, img_np, conf=APPAREL_CONF)
+    return [[b[0], b[1], b[2], b[3], b[4], b[5] + APPAREL_CLS_OFFSET] for b in preds]
+
+def _tile_infer_with(fn_run, img_np):
+    """Tile inference driver — fn_run is any callable that takes a patch and
+    returns [[x1,y1,x2,y2,conf,cls_idx], ...] in patch coordinates. This lets
+    the same tiling loop drive both COCO and apparel models without dup code."""
     H, W = img_np.shape[:2]
     if max(H, W) <= TILE:
-        return run_yolo(img_np)
+        return fn_run(img_np)
 
     stride = max(1, int(TILE * (1 - OVERLAP)))
     boxes, confs, classes = [], [], []
@@ -106,7 +178,7 @@ def tile_infer(img_np):
         while True:
             x2 = min(x + TILE, W)
             patch = img_np[y:y2, x:x2]
-            for bx1, by1, bx2, by2, c, k in run_yolo(patch):
+            for bx1, by1, bx2, by2, c, k in fn_run(patch):
                 boxes.append([bx1 + x, by1 + y, bx2 + x, by2 + y])
                 confs.append(c)
                 classes.append(k)
@@ -120,6 +192,16 @@ def tile_infer(img_np):
     s = torch.tensor(confs, dtype=torch.float32)
     keep = nms(b, s, YOLO_IOU).tolist()
     return [[*boxes[i], float(confs[i]), int(classes[i])] for i in keep]
+
+def tile_infer(img_np):
+    """Primary YOLO tiled inference. Wrapper preserved for existing callers."""
+    return _tile_infer_with(run_yolo, img_np)
+
+def tile_infer_apparel(img_np):
+    """Apparel YOLO tiled inference. No-op when apparel model isn't loaded."""
+    if apparel_model is None:
+        return []
+    return _tile_infer_with(run_yolo_apparel, img_np)
 
 def propose_rectangles(image_np):
     """Shape-based box proposals — catches products that YOLO isn't trained on."""
@@ -261,17 +343,40 @@ def total_coverage(boxes, H, W):
 def class_name_for(cls_idx):
     if cls_idx == -1: return "object"          # from OpenCV rects
     if cls_idx == -2: return "product"         # from OpenAI fallback
+    # Apparel model: cls_idx offset by APPAREL_CLS_OFFSET, look up in
+    # apparel_model.names. Guard on apparel_model presence — a leftover
+    # detection with an apparel-range cls_idx should degrade to 'apparel'
+    # rather than panic if the model somehow got unloaded.
+    if apparel_model is not None and cls_idx >= APPAREL_CLS_OFFSET:
+        if hasattr(apparel_model, "names"):
+            return apparel_model.names.get(int(cls_idx - APPAREL_CLS_OFFSET), "apparel")
+        return "apparel"
     return model.names.get(int(cls_idx), "object") if hasattr(model, "names") else "object"
 
 def run_full_detection(image_np, raw_bytes_for_oai=None, label="image"):
-    """The four-stage pipeline. Returns list of [x1,y1,x2,y2,conf,cls_idx]."""
+    """The five-stage pipeline (was four before apparel model added).
+    Returns list of [x1,y1,x2,y2,conf,cls_idx].
+    """
     H, W = image_np.shape[:2]
 
-    # 1. YOLO (tiled)
+    # 1a. YOLO COCO (tiled).
     preds = tile_infer(image_np) if USE_TILING else run_yolo(image_np)
     yolo_count = len(preds)
 
-    # 2. OpenCV rectangles
+    # 1b. YOLO apparel (tiled) — no-op when the model isn't loaded.
+    #     Merged into the SAME source bucket ('yolo' bucket in merge_nms's
+    #     source_of logic — any cls_idx != -1 and != -2 groups together)
+    #     so intra-YOLO NMS at iou_intra=0.55 naturally handles cross-model
+    #     overlap: two detections of the same physical product from COCO
+    #     and apparel dedupe with the higher-confidence one winning.
+    apparel_count = 0
+    if apparel_model is not None:
+        apparel_preds = tile_infer_apparel(image_np) if USE_TILING else run_yolo_apparel(image_np)
+        apparel_count = len(apparel_preds)
+        if apparel_preds:
+            preds = merge_nms(preds, apparel_preds)
+
+    # 2. OpenCV rectangles.
     rect_count = 0
     if FALLBACK_RECT:
         rects = propose_rectangles(image_np)
@@ -281,7 +386,10 @@ def run_full_detection(image_np, raw_bytes_for_oai=None, label="image"):
         # threshold; intra-source duplicates still get tight dedup.
         preds = merge_nms(preds, rects)
 
-    # 3. OpenAI fallback — only when recall looks weak
+    # 3. OpenAI fallback — only when recall looks weak. With apparel added,
+    #    fashion catalogs should hit OAI_TRIGGER_MIN_DETS/COVER less often,
+    #    saving both latency and the ~$0.0001/img cost. Kept as belt-and-
+    #    braces for edge cases (jewelry, cosmetics, etc.).
     oai_count = 0
     if OAI_BOX_FALLBACK and raw_bytes_for_oai is not None:
         cov = total_coverage(preds, H, W)
@@ -292,8 +400,17 @@ def run_full_detection(image_np, raw_bytes_for_oai=None, label="image"):
                 preds = merge_nms(preds, oai)
 
     if VERBOSE:
-        print(f"🔎 {label}: yolo={yolo_count} rects={rect_count} openai={oai_count} merged={len(preds)}", flush=True)
+        print(f"🔎 {label}: yolo={yolo_count} apparel={apparel_count} rects={rect_count} openai={oai_count} merged={len(preds)}", flush=True)
     return preds
+
+def _source_model_for(cls_idx):
+    """Which producer emitted this detection. Written into the response so
+    the backend can log per-source recall by brand without another call.
+    Backend doesn't read this field yet — it's an observability channel."""
+    if cls_idx == -1: return 'opencv'
+    if cls_idx == -2: return 'openai'
+    if apparel_model is not None and cls_idx >= APPAREL_CLS_OFFSET: return 'apparel'
+    return 'coco'
 
 def make_detection(image_np, pred, img_w, img_h, first_seen_sec=None):
     x1, y1, x2, y2, conf, cls_idx = pred
@@ -301,12 +418,13 @@ def make_detection(image_np, pred, img_w, img_h, first_seen_sec=None):
     if not b64:
         return None
     det = {
-        'base64':     b64,
-        'confidence': round(float(conf), 3),
+        'base64':       b64,
+        'confidence':   round(float(conf), 3),
         'x1': int(x1), 'y1': int(y1), 'x2': int(x2), 'y2': int(y2),
-        'class_name': class_name_for(cls_idx),
-        'img_width':  img_w,
-        'img_height': img_h,
+        'class_name':   class_name_for(cls_idx),
+        'source_model': _source_model_for(cls_idx),
+        'img_width':    img_w,
+        'img_height':   img_h,
     }
     if first_seen_sec is not None:
         det['first_seen_sec'] = round(first_seen_sec, 2)

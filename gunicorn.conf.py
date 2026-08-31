@@ -2,15 +2,29 @@
 # tweaks don't require a Docker rebuild.
 #
 # Env vars (defaults match what's safe on Render Standard 2GB):
-#   GUNICORN_WORKERS               1     YOLOv8x holds ~500MB; multiple workers OOM
+#   GUNICORN_WORKERS               1     YOLOv8x holds ~500MB per worker
+#                                        without preload. With APPAREL model
+#                                        also loaded (YOLO_APPAREL_ENABLED=
+#                                        true) the per-worker footprint
+#                                        doubles to ~1GB. Preload+COW is
+#                                        what makes N workers fit:
+#                                          - Free (512 MB):        1 worker COCO-only
+#                                          - Standard (2 GB):      2 workers dual-model preloaded
+#                                          - Standard Plus (4 GB): 5-6 workers dual-model preloaded
+#                                          - Pro (8 GB):           12+ workers dual-model preloaded
+#                                        See yolo_service.py APPAREL_ENABLED
+#                                        comment for the full memory model.
 #   GUNICORN_THREADS               1     PyTorch isn't reliably thread-safe
 #   GUNICORN_TIMEOUT               300   long enough for video frame extraction
 #   GUNICORN_MAX_REQUESTS          0     0 = disabled; set to ~100 to recycle workers
 #                                        and combat PyTorch memory creep
 #   GUNICORN_MAX_REQUESTS_JITTER   0     randomize restart timing (pair with MAX_REQUESTS)
-#   GUNICORN_PRELOAD_APP           false load app + model BEFORE forking workers — faster
-#                                        cold start, shared model across workers (COW),
-#                                        but reloads of the model in workers can race.
+#   GUNICORN_PRELOAD_APP           false load app + models BEFORE forking workers —
+#                                        faster cold start, shared models across
+#                                        workers via COW (big win now that two
+#                                        models can load). Safe to flip to true
+#                                        because workers do NOT reload models
+#                                        mid-request in this service.
 
 import os
 

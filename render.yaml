@@ -2,7 +2,13 @@ services:
   - type: web
     name: yolo-detection
     env: docker
-    plan: free
+    # Standard Plus (4 GB). Free (512 MB) was enough for COCO-only with 1
+    # worker; DeepFashion2/apparel model adds ~500 MB per worker, so dual-
+    # model needs headroom. Standard Plus + GUNICORN_PRELOAD_APP=true fits
+    # 5-6 workers comfortably. See yolo_service.py APPAREL_ENABLED comment
+    # for the memory math. Downgrade to Standard (2 GB, 2 workers) if the
+    # spend delta isn't earning its keep on the recall metric.
+    plan: standard_plus
     dockerfilePath: ./Dockerfile
     buildCommand: ""
     startCommand: "python yolo_service.py"
