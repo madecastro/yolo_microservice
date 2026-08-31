@@ -8,7 +8,40 @@
 #   3. OpenAI gpt-4o-mini box fallback (only when YOLO+rects look sparse)
 #   4. NMS merge + confidence filter
 
-import os, io, json, base64, cv2, numpy as np, torch, tempfile, traceback
+import os
+# ── Thread caps — MUST come BEFORE any torch/cv2/numpy import ────
+# On a preload_app=True + N-workers setup, PyTorch's intra-op
+# parallelism defaults to torch.get_num_threads() == cpu_count(). So
+# on a 4-core plan with GUNICORN_WORKERS=4, every worker tries to
+# grab all 4 cores → 16 threads on 4 cores → 4× slowdown → single
+# inference stretches from ~15s to ~60s → 6-image backfill batches
+# exceed the 300s gunicorn TIMEOUT and workers get SIGKILL'd. This
+# was the root cause of the WORKER TIMEOUT storm 2026-08-31: no
+# amount of tuning GUNICORN_WORKERS alone fixes it while PyTorch is
+# oversubscribing CPU per worker. Also caps OpenMP (opencv, numpy)
+# and MKL (transformers) which share the same class of failure.
+# Set to 1 by default so worker_count × threads_per_worker == cores
+# on any plan. Bump YOLO_TORCH_NUM_THREADS if a specific instance
+# ever has genuinely idle cores and inference is the wall.
+_torch_threads = max(1, int(os.getenv('YOLO_TORCH_NUM_THREADS', '1')))
+os.environ.setdefault('OMP_NUM_THREADS', str(_torch_threads))
+os.environ.setdefault('MKL_NUM_THREADS', str(_torch_threads))
+os.environ.setdefault('OPENBLAS_NUM_THREADS', str(_torch_threads))
+os.environ.setdefault('NUMEXPR_NUM_THREADS', str(_torch_threads))
+
+import io, json, base64, cv2, numpy as np, torch, tempfile, traceback
+# PyTorch's own explicit APIs — env vars alone are insufficient because
+# torch caches thread pools on first op. Setting these AFTER the import
+# but BEFORE any inference is what actually pins the intra-op pool.
+torch.set_num_threads(_torch_threads)
+try:
+    torch.set_num_interop_threads(_torch_threads)
+except RuntimeError:
+    # set_num_interop_threads only works BEFORE any parallel op runs.
+    # If a later config change tries to set it after torch has warmed,
+    # ignore — the initial value is what shipped.
+    pass
+print(f"🧵 torch threading pinned: intra={torch.get_num_threads()} inter={torch.get_num_interop_threads()} (OMP={_torch_threads} MKL={_torch_threads})", flush=True)
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 # ── Register HEIC/HEIF opener with PIL at boot (2026-08-31) ──────
