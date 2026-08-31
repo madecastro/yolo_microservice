@@ -152,11 +152,21 @@ class GroundingDinoWrapper:
         with self.torch.no_grad():
             outputs = self.model(**inputs)
         target_sizes = self.torch.tensor([image_pil.size[::-1]])  # (H,W)
-        results = self.processor.post_process_grounded_object_detection(
-            outputs, inputs.input_ids,
-            box_threshold=self.conf, text_threshold=self.conf,
-            target_sizes=target_sizes
-        )[0]
+        # Recent transformers (>=4.44) collapsed `box_threshold`+`text_threshold`
+        # into a single `threshold`. Older releases had both. Try new signature
+        # first, fall back for older transformers.
+        try:
+            results = self.processor.post_process_grounded_object_detection(
+                outputs, inputs.input_ids,
+                threshold=self.conf, text_threshold=self.conf,
+                target_sizes=target_sizes
+            )[0]
+        except TypeError:
+            results = self.processor.post_process_grounded_object_detection(
+                outputs, inputs.input_ids,
+                box_threshold=self.conf, text_threshold=self.conf,
+                target_sizes=target_sizes
+            )[0]
         out = []
         for score, label, box in zip(results["scores"], results["labels"], results["boxes"]):
             x1, y1, x2, y2 = [float(v) for v in box.tolist()]
@@ -229,8 +239,14 @@ def main():
     ap.add_argument("--fashionpedia",   action="store_true", help="Run Fashionpedia YOLOv8.")
     ap.add_argument("--grounding-dino", action="store_true", help="Run Grounding DINO open-vocab.")
     ap.add_argument("--all",            action="store_true", help="Enable all three.")
-    ap.add_argument("--fashionpedia-model", type=str, default=os.environ.get("FASHIONPEDIA_MODEL", "kesimeg/yolov8n-fashion"),
-                    help="Fashionpedia model path or HuggingFace repo id.")
+    # Fashionpedia default: keremberke's YOLOv8n trained on Fashionpedia,
+    # 46 fashion classes. Ultralytics needs a URL to a .pt file (arbitrary
+    # HF repo ids aren't loadable). Owner can override to any other .pt URL
+    # or local path via CLI/env.
+    ap.add_argument("--fashionpedia-model", type=str, default=os.environ.get(
+        "FASHIONPEDIA_MODEL",
+        "https://huggingface.co/keremberke/yolov8n-fashion/resolve/main/best.pt"
+    ), help="URL to a .pt file OR local .pt path.")
     ap.add_argument("--grounding-dino-model", type=str, default=os.environ.get("GROUNDING_DINO_MODEL", "IDEA-Research/grounding-dino-tiny"),
                     help="Grounding DINO HuggingFace model id.")
     ap.add_argument("--limit", type=int, default=None,
