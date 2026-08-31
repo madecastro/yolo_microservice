@@ -1,4 +1,10 @@
-FROM python:3.9-slim
+# python:3.11-slim (was python:3.9-slim through 2026-08-30). Modern
+# transformers releases require Python >=3.10 for full API compatibility
+# with the Grounding DINO processor; installing on 3.9 either failed
+# outright or picked up an older transformers with a broken post-process
+# signature. 3.11 is stable and still slim. If you need to pin lower for
+# an unrelated reason, pin transformers to <5.0.0 explicitly.
+FROM python:3.11-slim
 
 WORKDIR /app
 COPY yolo_service.py gunicorn.conf.py ./
@@ -25,11 +31,10 @@ RUN python -c "from ultralytics import YOLO; YOLO('yolov8x.pt')"
 # grounding-dino-tiny (~200MB, fastest); grounding-dino-base is ~700MB
 # with higher recall on cluttered images — swap via dashboard env.
 ARG YOLO_OPEN_VOCAB_MODEL="IDEA-Research/grounding-dino-tiny"
-RUN python -c "\
-from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection; \
-p = AutoProcessor.from_pretrained('$YOLO_OPEN_VOCAB_MODEL'); \
-m = AutoModelForZeroShotObjectDetection.from_pretrained('$YOLO_OPEN_VOCAB_MODEL'); \
-print(f'✓ pre-loaded {\"$YOLO_OPEN_VOCAB_MODEL\"}')"
+# Simple form — no f-string quote nesting to trip syntax quirks across
+# Python versions. Shell expands $YOLO_OPEN_VOCAB_MODEL before Python sees
+# the source.
+RUN python -c "from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection; AutoProcessor.from_pretrained('$YOLO_OPEN_VOCAB_MODEL'); AutoModelForZeroShotObjectDetection.from_pretrained('$YOLO_OPEN_VOCAB_MODEL'); print('pre-loaded: $YOLO_OPEN_VOCAB_MODEL')"
 
 EXPOSE 5000
 # Stdout unbuffered so gunicorn / Flask print() output streams to Render logs in real time.
