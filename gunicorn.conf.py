@@ -51,6 +51,19 @@ max_requests        = _int('GUNICORN_MAX_REQUESTS', 0)
 max_requests_jitter = _int('GUNICORN_MAX_REQUESTS_JITTER', 0)
 preload_app         = _bool('GUNICORN_PRELOAD_APP', False)
 
+# Print the resolved config at startup so a WORKER TIMEOUT flood is
+# never ambiguous about which value is actually in effect. The Render
+# dashboard sets these vars but there's no way to CONFIRM they propagated
+# without seeing them from inside the container. Prints once from the
+# gunicorn master before any worker forks.
+print(
+    f"⚙️  gunicorn config resolved: "
+    f"workers={workers} threads={threads} timeout={timeout} "
+    f"max_requests={max_requests} jitter={max_requests_jitter} "
+    f"preload_app={preload_app}",
+    flush=True
+)
+
 # Route gunicorn's own logs to stdout so Render's log stream picks them up
 # alongside the app's print() output.
 accesslog = '-'
