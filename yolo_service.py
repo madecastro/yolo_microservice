@@ -8,8 +8,8 @@
 #   3. OpenAI gpt-4o-mini box fallback (only when YOLO+rects look sparse)
 #   4. NMS merge + confidence filter
 
-import os, io, json, base64, cv2, numpy as np, torch, tempfile
-from PIL import Image, ImageOps
+import os, io, json, base64, cv2, numpy as np, torch, tempfile, traceback
+from PIL import Image, ImageOps, UnidentifiedImageError
 from flask import Flask, request, jsonify
 from ultralytics import YOLO
 from torchvision.ops import nms
@@ -523,14 +523,86 @@ def _make_gd_detection(image_np, gd_det, img_w, img_h):
     }
 
 
+# ── Image decode with STRUCTURED errors (not Flask HTML 500) ─────
+# Wraps PIL open so callers can distinguish "the URL you handed us
+# was not an image" (permanent — should be marked and never retried)
+# from a genuine service-side failure (transient — retry-safe). Before
+# this, PIL.UnidentifiedImageError bubbled all the way to Flask's
+# default HTML 500 handler, which the backend then classified as a
+# generic http-500 and threw away 2 retry attempts per bad URL.
+#
+# Callers are expected to catch _DecodeError and translate it to a
+# response — the class carries `code`, `http_status`, and the byte
+# count for observability. `traceback.print_exc()` fires before the
+# exception is raised so Render logs still carry the full trace even
+# when the response body is a clean JSON envelope.
+class _DecodeError(Exception):
+    def __init__(self, code, http_status, message, bytes_len):
+        self.code = code
+        self.http_status = http_status
+        self.message = message
+        self.bytes_len = bytes_len
+        super().__init__(message)
+
+def _decode_image_or_raise(raw):
+    """Decode a byte string into an RGB PIL image + EXIF transpose.
+    Raises _DecodeError with an actionable code on any failure; the
+    caller returns that as a JSON response with the right status."""
+    if not raw:
+        raise _DecodeError('empty-body', 400, 'zero-byte image body', 0)
+    try:
+        image = Image.open(io.BytesIO(raw)).convert('RGB')
+        return ImageOps.exif_transpose(image)
+    except UnidentifiedImageError:
+        # Most common failure in prod: media.fileUrl points at a Cloudinary
+        # asset that no longer exists or is behind an HTML "not found" page.
+        # Backend gets a HTTP 200 body of HTML, forwards it here verbatim.
+        # PERMANENT — backend must mark the Media so it never re-queues.
+        print(f"⚠️  decode: unidentified image ({len(raw)} bytes)", flush=True)
+        raise _DecodeError('unidentified-image', 400, 'cannot decode image bytes', len(raw))
+    except (OSError, ValueError) as e:
+        # Truncated JPEG, malformed PNG chunk, decompression bomb refusal.
+        # PERMANENT — the bytes are what they are.
+        print(f"⚠️  decode: bad image ({len(raw)} bytes) — {e}", flush=True)
+        raise _DecodeError('decode-error', 400, f'image decode failed: {str(e)[:200]}', len(raw))
+
+
+# ── Last-resort Flask errorhandler ────────────────────────────────
+# Anything an inline try/except missed lands here and returns JSON,
+# never the Flask default HTML page. Backend's _callYolo classifies
+# `err.response.data` as JSON — an HTML body throws it into the
+# generic "http-500" bucket and re-queues the caller.
+@app.errorhandler(Exception)
+def _json_uncaught(e):
+    # 4xx exceptions (Werkzeug abort) keep their own status; only
+    # actual 5xx / uncaught land here as HTTP 500.
+    status = getattr(e, 'code', 500) if hasattr(e, 'code') else 500
+    if not isinstance(status, int) or status < 100 or status > 599:
+        status = 500
+    if status >= 500:
+        # Print the trace to Render logs — the JSON body is deliberately
+        # short so backend can log it without pollution.
+        traceback.print_exc()
+    return jsonify({
+        'error': str(e)[:400] or 'internal error',
+        'code':  'internal-error' if status >= 500 else 'client-error'
+    }), status
+
+
 @app.route('/detect', methods=['POST'])
 def detect():
     if 'image' not in request.files:
-        return jsonify({'error': 'Image file is required'}), 400
+        return jsonify({'error': 'Image file is required', 'code': 'missing-image'}), 400
 
     raw = request.files['image'].read()
-    image = Image.open(io.BytesIO(raw)).convert('RGB')
-    image = ImageOps.exif_transpose(image)
+    try:
+        image = _decode_image_or_raise(raw)
+    except _DecodeError as de:
+        return jsonify({
+            'error': de.message,
+            'code':  de.code,
+            'bytes': de.bytes_len
+        }), de.http_status
     img_w, img_h = image.size
 
     # Open-vocab fork — when a prompt is provided AND Grounding DINO is
@@ -637,8 +709,18 @@ def detect_batch():
     for i, (f, prompt) in enumerate(zip(files, prompts)):
         try:
             raw = f.read()
-            image = Image.open(io.BytesIO(raw)).convert('RGB')
-            image = ImageOps.exif_transpose(image)
+            try:
+                image = _decode_image_or_raise(raw)
+            except _DecodeError as de:
+                # Per-slot permanent failure — do NOT let the caller retry.
+                # The `code` field is what backend/detectYoloForMediaBatch
+                # reads to stamp the Media as bad-source and skip re-queue.
+                error_count += 1
+                results.append({
+                    'width': 0, 'height': 0, 'detections': [],
+                    'error': de.message, 'code': de.code, 'bytes': de.bytes_len
+                })
+                continue
             img_w, img_h = image.size
 
             prompt_clean = (prompt or '').strip()
@@ -679,9 +761,16 @@ def detect_batch():
                 results.append({'width': img_w, 'height': img_h, 'detections': detections})
                 coco_count += 1
         except Exception as e:
+            # Something we DIDN'T anticipate. Print the trace so Render
+            # logs preserve the shape (unlike the per-image _DecodeError
+            # branch above, this is genuinely unexpected).
             error_count += 1
+            traceback.print_exc()
             print(f"⚠️  /detect-batch item #{i} failed: {e}", flush=True)
-            results.append({'width': 0, 'height': 0, 'detections': [], 'error': str(e)[:200]})
+            results.append({
+                'width': 0, 'height': 0, 'detections': [],
+                'error': str(e)[:200], 'code': 'inference-error'
+            })
 
     print(f"📦 /detect-batch returning {len(results)} result(s) — open_vocab={open_vocab_count} coco={coco_count} errors={error_count}", flush=True)
     return jsonify({'results': results})
