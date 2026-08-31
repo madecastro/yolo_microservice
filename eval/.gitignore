@@ -1,0 +1,15 @@
+# Local venv used to install eval deps.
+.venv/
+__pycache__/
+*.pyc
+
+# Local .env (may hold MONGODB_URI).
+.env
+
+# Eval outputs — these carry brand-specific product info and belong
+# in local disk / private analysis, not in git.
+data/media_urls.json
+data/eval_results.csv
+
+# Model weights cache. First run downloads ~330 MB; keep out of git.
+*.pt

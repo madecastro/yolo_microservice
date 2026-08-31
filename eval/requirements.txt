@@ -1,0 +1,24 @@
+# Model evaluation dependencies. Separate from the production Docker image
+# so a heavy Grounding DINO / transformers install doesn't slow down the
+# yolo_microservice's cold start.
+#
+# Install: python -m pip install -r eval/requirements.txt
+# Recommended: use a virtualenv (python -m venv eval/.venv) so these don't
+# collide with your global Python.
+
+# MongoDB client for pulling real Media URLs + CatalogProduct data.
+pymongo>=4.6.0
+python-dotenv>=1.0.0
+
+# YOLOv8 (COCO baseline + Fashionpedia checkpoint).
+ultralytics>=8.1.0
+
+# Grounding DINO for open-vocabulary detection. Uses HuggingFace's
+# `AutoModelForZeroShotObjectDetection` — no separate compile step.
+transformers>=4.44.0
+torch>=2.0.0
+Pillow>=10.0.0
+
+# Data wrangling / summary tables.
+pandas>=2.0.0
+requests>=2.31.0
