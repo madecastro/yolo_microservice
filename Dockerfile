@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y \
     libglib2.0-0 \
     ffmpeg \
     && pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu \
-    && pip install flask gunicorn pillow opencv-python-headless numpy ultralytics openai pandas seaborn transformers \
+    && pip install flask gunicorn pillow opencv-python-headless numpy ultralytics openai pandas seaborn transformers pi-heif \
     && rm -rf /var/lib/apt/lists/*
 
 # Pre-download YOLOv8x weights at build time so first request doesn't cold-start.

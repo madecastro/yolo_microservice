@@ -14,6 +14,27 @@ from flask import Flask, request, jsonify
 from ultralytics import YOLO
 from torchvision.ops import nms
 
+# ── Register HEIC/HEIF opener with PIL at boot (2026-08-31) ──────
+# iPhone photos default to HEIC. Without pi-heif registered, PIL raises
+# UnidentifiedImageError on 2-4 MB HEIC bodies from UGC ingest (Meta,
+# Apify Shopify scrapes on iPhone-shot stores). Ultralytics has a
+# runtime auto-install fallback (`requirements: pi-heif not found,
+# attempting AutoUpdate...`) but the currently-running Python process
+# can't load the newly-installed plugin — its own warning says
+# "Restart runtime or rerun command for updates to take effect". So
+# every HEIC upload paid ~2s of pip subprocess overhead AND still 400'd.
+# Registering the opener HERE, before the app boots, means PIL knows
+# about HEIC from the first request and never triggers the auto-install
+# path. Fail-open on ImportError so a missing pi-heif in the image
+# (shouldn't happen — it's in the Dockerfile — but keeps the service
+# up in local dev without it) still leaves the service serving JPEG/PNG.
+try:
+    from pi_heif import register_heif_opener
+    register_heif_opener()
+    print("💚 pi-heif registered — PIL can now decode HEIC/HEIF natively", flush=True)
+except ImportError:
+    print("⚠️  pi-heif not installed — HEIC uploads will 400 with code=unidentified-image", flush=True)
+
 # ── YOLO knobs ────────────────────────────────────────────────────
 MODEL_PATH    = os.getenv("YOLO_MODEL", "yolov8x.pt")
 YOLO_CONF     = float(os.getenv("YOLO_CONF", "0.20"))
