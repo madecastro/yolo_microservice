@@ -10,30 +10,27 @@
 
 import os, io, json, base64, cv2, numpy as np, torch, tempfile, traceback
 from PIL import Image, ImageOps, UnidentifiedImageError
-from flask import Flask, request, jsonify
-from ultralytics import YOLO
-from torchvision.ops import nms
 
 # ── Register HEIC/HEIF opener with PIL at boot (2026-08-31) ──────
-# iPhone photos default to HEIC. Without pi-heif registered, PIL raises
-# UnidentifiedImageError on 2-4 MB HEIC bodies from UGC ingest (Meta,
-# Apify Shopify scrapes on iPhone-shot stores). Ultralytics has a
-# runtime auto-install fallback (`requirements: pi-heif not found,
-# attempting AutoUpdate...`) but the currently-running Python process
-# can't load the newly-installed plugin — its own warning says
-# "Restart runtime or rerun command for updates to take effect". So
-# every HEIC upload paid ~2s of pip subprocess overhead AND still 400'd.
-# Registering the opener HERE, before the app boots, means PIL knows
-# about HEIC from the first request and never triggers the auto-install
-# path. Fail-open on ImportError so a missing pi-heif in the image
-# (shouldn't happen — it's in the Dockerfile — but keeps the service
-# up in local dev without it) still leaves the service serving JPEG/PNG.
+# CRITICAL ORDER: this MUST come BEFORE the ultralytics import.
+# Ultralytics monkey-patches PIL.Image.open (utils/patches.py:image_open)
+# during its own import; if we register pi-heif AFTER that, the patched
+# open path can miss the new codec even though the PIL plugin registry
+# is updated. pi-heif calls Image.register_extension / register_mime /
+# register_open — these must be done before anything else caches the
+# open callable. Fail-open on ImportError (local dev without the wheel
+# still serves JPEG/PNG).
 try:
     from pi_heif import register_heif_opener
     register_heif_opener()
-    print("💚 pi-heif registered — PIL can now decode HEIC/HEIF natively", flush=True)
-except ImportError:
-    print("⚠️  pi-heif not installed — HEIC uploads will 400 with code=unidentified-image", flush=True)
+    import pi_heif as _pi_heif_probe
+    print(f"💚 pi-heif {_pi_heif_probe.__version__} registered — PIL can now decode HEIC/HEIF natively", flush=True)
+except ImportError as _pi_heif_err:
+    print(f"⚠️  pi-heif not installed ({_pi_heif_err}) — HEIC uploads will 400 with code=unidentified-image", flush=True)
+
+from flask import Flask, request, jsonify
+from ultralytics import YOLO
+from torchvision.ops import nms
 
 # ── YOLO knobs ────────────────────────────────────────────────────
 MODEL_PATH    = os.getenv("YOLO_MODEL", "yolov8x.pt")
@@ -565,6 +562,39 @@ class _DecodeError(Exception):
         self.bytes_len = bytes_len
         super().__init__(message)
 
+def _sniff_bytes(raw):
+    """Return (hex_head, ascii_head, format_guess) for the first 20 bytes
+    of the body. Used ONLY in error logs so we can identify what format
+    a "cannot decode" body actually is (HEIC, AVIF, HTML error page,
+    video container, etc.) without guessing."""
+    head = raw[:20] if raw else b''
+    hex_head = head.hex()
+    ascii_head = ''.join(chr(b) if 32 <= b < 127 else '.' for b in head)
+    guess = 'unknown'
+    if head[:3] == b'\xff\xd8\xff':                    guess = 'jpeg'
+    elif head[:8] == b'\x89PNG\r\n\x1a\n':            guess = 'png'
+    elif head[:6] in (b'GIF87a', b'GIF89a'):          guess = 'gif'
+    elif head[:2] == b'BM':                           guess = 'bmp'
+    elif head[:4] == b'RIFF' and head[8:12] == b'WEBP': guess = 'webp'
+    elif head[4:8] == b'ftyp':
+        # ISO Base Media File Format container — HEIC/HEIF/AVIF/MP4
+        brand = head[8:12]
+        if brand in (b'heic', b'heix', b'hevc', b'heim', b'heis', b'hevm', b'hevs'):
+            guess = f'heic ({brand.decode("ascii", errors="replace")})'
+        elif brand in (b'mif1', b'msf1'):
+            guess = f'heif ({brand.decode("ascii", errors="replace")})'
+        elif brand in (b'avif', b'avis'):
+            guess = f'avif ({brand.decode("ascii", errors="replace")})'
+        elif brand in (b'isom', b'iso2', b'mp41', b'mp42', b'MSNV', b'M4V ', b'qt  '):
+            guess = f'video/mp4 ({brand.decode("ascii", errors="replace")})'
+        else:
+            guess = f'iso-bmff ({brand.decode("ascii", errors="replace")})'
+    elif head[:5] == b'<!DOC' or head[:5] == b'<html' or head[:6] == b'<HTML>':
+        guess = 'html'
+    elif head[:1] == b'{' or head[:1] == b'[':        guess = 'json?'
+    elif head[:2] == b'II' or head[:2] == b'MM':      guess = 'tiff'
+    return hex_head, ascii_head, guess
+
 def _decode_image_or_raise(raw):
     """Decode a byte string into an RGB PIL image + EXIF transpose.
     Raises _DecodeError with an actionable code on any failure; the
@@ -575,16 +605,20 @@ def _decode_image_or_raise(raw):
         image = Image.open(io.BytesIO(raw)).convert('RGB')
         return ImageOps.exif_transpose(image)
     except UnidentifiedImageError:
-        # Most common failure in prod: media.fileUrl points at a Cloudinary
-        # asset that no longer exists or is behind an HTML "not found" page.
-        # Backend gets a HTTP 200 body of HTML, forwards it here verbatim.
-        # PERMANENT — backend must mark the Media so it never re-queues.
-        print(f"⚠️  decode: unidentified image ({len(raw)} bytes)", flush=True)
-        raise _DecodeError('unidentified-image', 400, 'cannot decode image bytes', len(raw))
+        # Log first-20-byte magic so we can tell WHAT this actually was
+        # (HEIC that pi-heif didn't register, AVIF needing pillow-avif,
+        # HTML error page from Cloudinary, video misfiled as image, ...).
+        # Was flying blind on "cannot decode" — now the guess appears on
+        # every rejection.
+        hex_head, ascii_head, guess = _sniff_bytes(raw)
+        print(f"⚠️  decode: unidentified image ({len(raw)} bytes, guess={guess}) "
+              f"head={hex_head} ascii={ascii_head!r}", flush=True)
+        raise _DecodeError('unidentified-image', 400, f'cannot decode image bytes ({guess})', len(raw))
     except (OSError, ValueError) as e:
         # Truncated JPEG, malformed PNG chunk, decompression bomb refusal.
         # PERMANENT — the bytes are what they are.
-        print(f"⚠️  decode: bad image ({len(raw)} bytes) — {e}", flush=True)
+        hex_head, ascii_head, guess = _sniff_bytes(raw)
+        print(f"⚠️  decode: bad image ({len(raw)} bytes, guess={guess}) — {e}", flush=True)
         raise _DecodeError('decode-error', 400, f'image decode failed: {str(e)[:200]}', len(raw))
 
 
